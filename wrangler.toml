@@ -1,0 +1,11 @@
+name = "spheria-api"
+main = "worker.js"
+compatibility_date = "2024-09-25"
+
+# Database D1 già creato in dashboard (nome: spheria-db).
+# Metti qui l'ID una sola volta: dashboard D1 → spheria-db → Overview → Database ID,
+# oppure da terminale: npx wrangler d1 list
+[[d1_databases]]
+binding = "DB"
+database_name = "spheria-db"
+database_id = "METTI_QUI_DATABASE_ID"
