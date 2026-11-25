@@ -8,4 +8,4 @@ compatibility_date = "2024-09-25"
 [[d1_databases]]
 binding = "DB"
 database_name = "spheria-db"
-database_id = "METTI_QUI_DATABASE_ID"
+database_id = "0cbb8b15-20e6-4cee-8cb6-ae653a2c31f4"
