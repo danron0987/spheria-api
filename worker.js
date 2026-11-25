@@ -1,8 +1,15 @@
 /* SPHERIA API — Cloudflare Worker + D1 (file unico, pronto da incollare in dashboard).
- * Versione logica: pvp28 (come pvp27 + contatori missioni Fedeltà/Sfera/Negozio/Draft).
- * Salvataggio completo (volto/volti/stagione/premi-rango/gettoni/mini-bustine/nuovi-contatori),
+ * Versione logica: pvp29 (come pvp28 + stagioni bisettimanali server, rivincita, emote, anti-farm).
+ * Salvataggio completo (volto/volti/stagione-premi/gettoni/mini-bustine/nuovi-contatori),
  * niente più reset mensile: i punti ranked restano per sempre e si scende solo perdendo
  * (la "stagione" premi vive sul client con la barra bisettimanale).
+ * STAGIONI (server): ranked_seasons(account_id, season, ...) con season bisettimanale "sN"
+ * allineata al client (EPOCH 2026-01-05, 14gg); punti stagione da zero ogni ciclo, tier dagli
+ * stessi soglie dei ranghi; l'eterno resta per albo d'oro + premi rango una tantum.
+ * RIVINCITA: pvp_rematch(code stanza vecchia -> nuova stanza); vale solo ranked/reale.
+ * Anti-farm: max 3 ranked/giorno contro la stessa coppia, poi zero punti ranked (statistiche sì).
+ * EMOTE: pvp_emotes(code, side, text, at), solo testi dalla lista fissa, rate 5s, via state.
+ * Tabelle nuove create al volo (CREATE TABLE IF NOT EXISTS): nessuna migration manuale.
  * I loggati non perdono più lo stock di bustine se cancellano i dati dell'app.
  *
  * SCHEMA DEL SALVATAGGIO (tabella saves, chiave "data"): per non perdere niente in
@@ -237,7 +244,7 @@ export default {
     try {
       // ---------- salute (test da browser) ----------
       if (req.method === "GET" && path === "/api/health") {
-        return json(env, req, { ok: true, time: Date.now(), v: "pvp28" });
+        return json(env, req, { ok: true, time: Date.now(), v: "pvp29" });
       }
 
       // ---------- login Google -> sessione ----------
@@ -307,7 +314,23 @@ export default {
           } catch (e) {}
           rk = { points: rk.points | 0, wins: rk.wins | 0, losses: rk.losses | 0, season: curSeason() };
         }
-        return json(env, req, { account: acc, stats: st, ranked: rk || { points: 0, wins: 0, losses: 0, season: curSeason() } });
+        // Stagione bisettimanale server: riga corrente + ultima chiusa + record (albo d'oro).
+        var seasonInfo = null;
+        try {
+          var s2 = season2();
+          var cur2 = await seasonRow(env, accountId, s2);
+          var prev2 = await env.DB.prepare("SELECT season, points FROM ranked_seasons WHERE account_id = ? AND season != ? ORDER BY season DESC LIMIT 1").bind(accountId, s2).first();
+          var best2 = await env.DB.prepare("SELECT MAX(points) AS m FROM ranked_seasons WHERE account_id = ?").bind(accountId).first();
+          seasonInfo = {
+            id: s2, points: cur2.points, wins: cur2.wins, losses: cur2.losses,
+            prev: prev2 ? { id: prev2.season, points: prev2.points | 0 } : null,
+            best: (best2 && best2.m) | 0,
+          };
+        } catch (e) {}
+        return json(env, req, {
+          account: acc, stats: st, ranked: rk || { points: 0, wins: 0, losses: 0, season: curSeason() },
+          season: seasonInfo,
+        });
       }
 
       if (req.method === "GET" && path === "/api/save") {
@@ -453,6 +476,59 @@ export default {
         var d = new Date();
         return d.getUTCFullYear() + "-" + ("0" + (d.getUTCMonth() + 1)).slice(-2);
       }
+      // Stagioni bisettimanali "sN" allineate al client (EPOCH lunedì 2026-01-05, cicli 14gg).
+      var SEASON2_EPOCH = Date.UTC(2026, 0, 5), SEASON2_LEN = 14 * 24 * 3600 * 1000;
+      function season2(now) { return "s" + Math.floor(((now || Date.now()) - SEASON2_EPOCH) / SEASON2_LEN); }
+      // Tabelle nuove: create al volo, così non serve nessuna migration manuale sul DB live.
+      async function ensureExtraTables(env) {
+        try {
+          await env.DB.prepare("CREATE TABLE IF NOT EXISTS ranked_seasons (account_id TEXT NOT NULL, season TEXT NOT NULL, points INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0, losses INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (account_id, season))").run();
+        } catch (e) {}
+        try {
+          await env.DB.prepare("CREATE TABLE IF NOT EXISTS pvp_rematch (code TEXT PRIMARY KEY, from_side TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', new_code TEXT, created_at INTEGER NOT NULL)").run();
+        } catch (e) {}
+        try {
+          await env.DB.prepare("CREATE TABLE IF NOT EXISTS pvp_emotes (code TEXT NOT NULL, side TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL)").run();
+        } catch (e) {}
+        try {
+          await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_pvp_emotes_code ON pvp_emotes (code)").run();
+        } catch (e) {}
+      }
+      // Riga stagione (creata a zero se manca), poi delta applicato con seasonAdd.
+      async function seasonRow(env, accountId, season) {
+        await ensureExtraTables(env);
+        var row = null;
+        try {
+          row = await env.DB.prepare("SELECT points, wins, losses FROM ranked_seasons WHERE account_id = ? AND season = ?").bind(accountId, season).first();
+        } catch (e) {}
+        if (!row) {
+          try {
+            await env.DB.prepare("INSERT OR IGNORE INTO ranked_seasons (account_id, season, points, wins, losses, updated_at) VALUES (?, ?, 0, 0, 0, ?)").bind(accountId, season, Date.now()).run();
+          } catch (e) {}
+          row = { points: 0, wins: 0, losses: 0 };
+        }
+        return { points: row.points | 0, wins: row.wins | 0, losses: row.losses | 0 };
+      }
+      async function seasonAdd(env, accountId, season, dPts, won) {
+        await ensureExtraTables(env);
+        var now = Date.now();
+        try {
+          await env.DB.prepare("INSERT INTO ranked_seasons (account_id, season, points, wins, losses, updated_at) VALUES (?, ?, ?, ?, ?, ?) " +
+            "ON CONFLICT(account_id, season) DO UPDATE SET points = points + excluded.points, wins = wins + excluded.wins, losses = losses + excluded.losses, updated_at = excluded.updated_at")
+            .bind(accountId, season, dPts | 0, won ? 1 : 0, won ? 0 : 1, now).run();
+        } catch (e) {}
+      }
+      // Anti-farm: quante ranked "done" OGGI (UTC) tra la stessa coppia? Max 3 con punti.
+      async function rankedPairToday(env, aId, bId, exceptCode) {
+        try {
+          var dayStart = new Date();
+          dayStart.setUTCHours(0, 0, 0, 0);
+          var r = await env.DB.prepare("SELECT COUNT(*) AS n FROM rooms WHERE ranked = 1 AND status = 'done' AND created_at >= ? AND code != ? AND ((a_id = ? AND b_id = ?) OR (a_id = ? AND b_id = ?))")
+            .bind(dayStart.getTime(), exceptCode || "", aId, bId, bId, aId).first();
+          return (r && r.n) | 0;
+        } catch (e) { return 0; }
+      }
+      var EMOTE_TEXTS = { gg: 1, bella: 1, ops: 1, ancora: 1 };
       function pvpCanon(turn, move, salt) {
         // Ricostruito dai campi (ordine fisso) cosi client e server coincidono sempre
         var m = move && move.main ? move.main.c + ":" + (move.main.t ? 1 : 0) : "-";
@@ -592,6 +668,11 @@ export default {
           };
         });
         var isA = sside === "A";
+        var oppEmote = null;
+        try {
+          var er0 = await env.DB.prepare("SELECT text, at FROM pvp_emotes WHERE code = ? AND side = ? ORDER BY at DESC LIMIT 1").bind(sroom.code, isA ? "B" : "A").first();
+          if (er0) oppEmote = { text: String(er0.text || ""), at: (er0.at | 0) || 0 };
+        } catch (e) {}
         return json(env, req, {
           ok: true, status: sroom.status, side: sside,
           spheres: JSON.parse(sroom.spheres),
@@ -603,6 +684,7 @@ export default {
           winner: sroom.winner || null,
           ranked: !!sroom.ranked,
           leftBy: sroom.left_by || null,
+          oppEmote: oppEmote,
         });
       }
 
@@ -651,6 +733,9 @@ export default {
           if (cur.ranked) {
             // Punti Sfere: vittoria +20 (+5 schiacciante con 10+ di scarto, +5 impresa contro rango superiore),
             // sconfitta -(13 - propri VP) con minimo 0 — SI SCENDE di rango (retrocessioni).
+            // Anti-farm: oltre 3 ranked/giorno contro la stessa coppia, zero punti ranked (statistiche sì).
+            var farmN = await rankedPairToday(env, cur.a_id, cur.b_id, cur.code);
+            var farm = farmN >= 3;
             var rkq = await env.DB.prepare("SELECT account_id, points FROM ranked WHERE account_id = ? OR account_id = ?")
               .bind(cur.a_id, cur.b_id).all();
             var rpts = {};
@@ -664,13 +749,17 @@ export default {
             if (rankStart(wPre) < rankStart(lPre)) wBonus += 5; // impresa
             var na = wa2 ? pa0 + 20 + wBonus : Math.max(0, pa0 - (13 - (psa | 0)));
             var nb = wb2 ? pb0 + 20 + wBonus : Math.max(0, pb0 - (13 - (psb | 0)));
-            var seasonNow = curSeason();
-            await env.DB.prepare("INSERT INTO ranked (account_id, points, wins, losses, season, updated_at) VALUES (?, ?, ?, ?, ?, ?) " +
-              "ON CONFLICT(account_id) DO UPDATE SET points = excluded.points, wins = wins + ?, losses = losses + ?, season = excluded.season, updated_at = excluded.updated_at")
-              .bind(cur.a_id, na, wa2, 1 - wa2, seasonNow, now2, wa2, 1 - wa2).run();
-            await env.DB.prepare("INSERT INTO ranked (account_id, points, wins, losses, season, updated_at) VALUES (?, ?, ?, ?, ?, ?) " +
-              "ON CONFLICT(account_id) DO UPDATE SET points = excluded.points, wins = wins + ?, losses = losses + ?, season = excluded.season, updated_at = excluded.updated_at")
-              .bind(cur.b_id, nb, wb2, 1 - wb2, seasonNow, now2, wb2, 1 - wb2).run();
+            var seasonNow = curSeason(), s2now = season2();
+            if (!farm) {
+              await env.DB.prepare("INSERT INTO ranked (account_id, points, wins, losses, season, updated_at) VALUES (?, ?, ?, ?, ?, ?) " +
+                "ON CONFLICT(account_id) DO UPDATE SET points = excluded.points, wins = wins + ?, losses = losses + ?, season = excluded.season, updated_at = excluded.updated_at")
+                .bind(cur.a_id, na, wa2, 1 - wa2, seasonNow, now2, wa2, 1 - wa2).run();
+              await env.DB.prepare("INSERT INTO ranked (account_id, points, wins, losses, season, updated_at) VALUES (?, ?, ?, ?, ?, ?) " +
+                "ON CONFLICT(account_id) DO UPDATE SET points = excluded.points, wins = wins + ?, losses = losses + ?, season = excluded.season, updated_at = excluded.updated_at")
+                .bind(cur.b_id, nb, wb2, 1 - wb2, seasonNow, now2, wb2, 1 - wb2).run();
+              await seasonAdd(env, cur.a_id, s2now, na - pa0, wa2);
+              await seasonAdd(env, cur.b_id, s2now, nb - pb0, wb2);
+            }
           }
           return json(env, req, { ok: true, status: "done", winner: decided });
         }
@@ -702,7 +791,17 @@ export default {
         await env.DB.prepare("INSERT INTO ranked (account_id, points, wins, losses, season, updated_at) VALUES (?, ?, ?, ?, ?, ?) " +
           "ON CONFLICT(account_id) DO UPDATE SET points = excluded.points, wins = excluded.wins, losses = excluded.losses, season = excluded.season, updated_at = excluded.updated_at")
           .bind(accountId, qpts, qnw, qnl, curSeason(), qnow).run();
-        return json(env, req, { ok: true, points: qpts, wins: qnw, losses: qnl });
+        var qSeason = null;
+        try {
+          await seasonAdd(env, accountId, season2(qnow), qpts - qp0, qwon ? 1 : 0);
+          var qcur = await seasonRow(env, accountId, season2(qnow));
+          var qprev = await env.DB.prepare("SELECT season, points FROM ranked_seasons WHERE account_id = ? AND season != ? ORDER BY season DESC LIMIT 1").bind(accountId, season2(qnow)).first();
+          var qbest = await env.DB.prepare("SELECT MAX(points) AS m FROM ranked_seasons WHERE account_id = ?").bind(accountId).first();
+          qSeason = { id: season2(qnow), points: qcur.points, wins: qcur.wins, losses: qcur.losses,
+            prev: qprev ? { id: qprev.season, points: qprev.points | 0 } : null,
+            best: (qbest && qbest.m) | 0 };
+        } catch (e) {}
+        return json(env, req, { ok: true, points: qpts, wins: qnw, losses: qnl, season: qSeason });
       }
 
       if (req.method === "POST" && path === "/api/pvp/leave") {
@@ -795,6 +894,101 @@ export default {
 
       if (req.method === "POST" && path === "/api/pvp/queue/leave") {
         await env.DB.prepare("DELETE FROM queue WHERE account_id = ?").bind(accountId).run();
+        return json(env, req, { ok: true });
+      }
+
+      // ---------- RIVINCITA (solo stanze reali finite: offerta -> nuova stanza, stessi deck) ----------
+      // A offre (POST offer), B vede l'offerta col GET e accetta/rifiuta; A scopre l'esito col GET.
+      // Scade dopo 90s. Max 3 ranked/giorno stessa coppia gestito dal report (anti-farm).
+      async function rematchSweep(env) {
+        try { await env.DB.prepare("DELETE FROM pvp_rematch WHERE created_at < ?").bind(Date.now() - 90000).run(); } catch (e) {}
+      }
+      if ((req.method === "POST" || req.method === "GET") && path === "/api/pvp/rematch") {
+        await ensureExtraTables(env);
+        await rematchSweep(env);
+        if (req.method === "GET") {
+          var gcode = new URL(req.url).searchParams.get("code");
+          var grow = await pvpRoom(gcode);
+          if (!grow) return json(env, req, { error: "no_room" }, 404);
+          var gside = pvpSide(grow, accountId);
+          if (!gside) return json(env, req, { error: "bad_room" }, 409);
+          var goffer = null;
+          try { goffer = await env.DB.prepare("SELECT * FROM pvp_rematch WHERE code = ?").bind(grow.code).first(); } catch (e) {}
+          if (!goffer) return json(env, req, { ok: true, offer: null });
+          return json(env, req, {
+            ok: true,
+            offer: { mine: goffer.from_side === gside, status: goffer.status, newCode: goffer.new_code || null },
+          });
+        }
+        var obody = await readJson(req);
+        var oroom = await pvpRoom(obody.code);
+        if (!oroom) return json(env, req, { error: "no_room" }, 404);
+        var oside = pvpSide(oroom, accountId);
+        if (!oside) return json(env, req, { error: "bad_room" }, 409);
+        var action = String(obody.action || "");
+        if (action === "offer" || action === "cancel") {
+          if (oroom.status !== "done" && oroom.status !== "left") return json(env, req, { error: "not_over" }, 409);
+          if (action === "offer") {
+            try {
+              await env.DB.prepare("INSERT INTO pvp_rematch (code, from_side, status, created_at) VALUES (?, ?, 'open', ?) " +
+                "ON CONFLICT(code) DO UPDATE SET from_side = excluded.from_side, status = 'open', new_code = NULL, created_at = excluded.created_at")
+                .bind(oroom.code, oside, Date.now()).run();
+            } catch (e) {}
+            return json(env, req, { ok: true, status: "open" });
+          }
+          try { await env.DB.prepare("DELETE FROM pvp_rematch WHERE code = ?").bind(oroom.code).run(); } catch (e) {}
+          return json(env, req, { ok: true, status: "cancelled" });
+        }
+        if (action === "decline") {
+          try { await env.DB.prepare("UPDATE pvp_rematch SET status = 'declined' WHERE code = ?").bind(oroom.code).run(); } catch (e) {}
+          return json(env, req, { ok: true, status: "declined" });
+        }
+        if (action === "accept") {
+          var aoff = null;
+          try { aoff = await env.DB.prepare("SELECT * FROM pvp_rematch WHERE code = ?").bind(oroom.code).first(); } catch (e) {}
+          if (!aoff || aoff.status !== "open" || aoff.from_side === oside) return json(env, req, { error: "no_offer" }, 409);
+          // Nuova stanza: stessi giocatori/deck/ranked, nuove sfere. Chi accetta diventa A della nuova.
+          var ncode = "";
+          for (var ni = 0; ni < 8; ni++) {
+            var nc = pvpCode();
+            var ndup = await env.DB.prepare("SELECT code FROM rooms WHERE code = ?").bind(nc).first();
+            if (!ndup) { ncode = nc; break; }
+          }
+          if (!ncode) return json(env, req, { error: "busy" }, 503);
+          var nnow = Date.now();
+          var meFirst = oside === "B";
+          var naId = meFirst ? accountId : oroom.a_id, nbId = meFirst ? oroom.a_id : oroom.b_id;
+          var naDeck = meFirst ? oroom.b_deck : oroom.a_deck, nbDeck = meFirst ? oroom.a_deck : oroom.b_deck;
+          var meAcc = await env.DB.prepare("SELECT name, avatar FROM accounts WHERE id = ?").bind(accountId).first();
+          var foeAcc = await env.DB.prepare("SELECT name, avatar FROM accounts WHERE id = ?").bind(meFirst ? oroom.a_id : oroom.b_id).first();
+          await env.DB.prepare("INSERT INTO rooms (code, status, a_id, b_id, a_name, a_avatar, a_deck, b_name, b_avatar, b_deck, spheres, turn, ranked, updated_at, created_at) VALUES (?, 'playing', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)")
+            .bind(ncode, naId, nbId,
+              (meAcc && meAcc.name) || "Giocatore", (meAcc && meAcc.avatar) || null, naDeck,
+              (foeAcc && foeAcc.name) || "Avversario", (foeAcc && foeAcc.avatar) || null, nbDeck,
+              JSON.stringify(pvpSpheres(40)), oroom.ranked ? 1 : 0, nnow, nnow).run();
+          try { await env.DB.prepare("UPDATE pvp_rematch SET status = 'accepted', new_code = ? WHERE code = ?").bind(ncode, oroom.code).run(); } catch (e) {}
+          return json(env, req, { ok: true, status: "accepted", newCode: ncode, side: meFirst ? "A" : "B" });
+        }
+        return json(env, req, { error: "bad_action" }, 400);
+      }
+
+      // ---------- EMOTE (solo testi dalla lista fissa, rate 5s, letti via /api/pvp/state) ----------
+      if (req.method === "POST" && path === "/api/pvp/emote") {
+        var ebody = await readJson(req);
+        var eroom = await pvpRoom(ebody.code);
+        if (!eroom) return json(env, req, { error: "no_room" }, 404);
+        var eside = pvpSide(eroom, accountId);
+        if (!eside || eroom.status !== "playing") return json(env, req, { error: "bad_room" }, 409);
+        var etext = String(ebody.text || "");
+        if (!EMOTE_TEXTS[etext]) return json(env, req, { error: "bad_emote" }, 400);
+        await ensureExtraTables(env);
+        var elast = 0;
+        try {
+          var elr = await env.DB.prepare("SELECT MAX(at) AS m FROM pvp_emotes WHERE code = ? AND side = ?").bind(eroom.code, eside).first();
+          elast = (elr && elr.m) | 0;
+        } catch (e) {}
+        if (Date.now() - elast < 5000) return json(env, req, { error: "too_fast" }, 429);
+        try { await env.DB.prepare("INSERT INTO pvp_emotes (code, side, text, at) VALUES (?, ?, ?, ?)").bind(eroom.code, eside, etext, Date.now()).run(); } catch (e) {}
         return json(env, req, { ok: true });
       }
 
