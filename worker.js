@@ -426,7 +426,8 @@ export default {
       // Costi carte: letti da D1 (tabella `cards`) con cache di 5 minuti, fallback completo
       // se la tabella manca. Carte nuove = una riga INSERT in D1, niente più deploy del worker.
       var PVP_COST_FALLBACK = { c01: 4, c02: 3, c03: 4, c04: 5, c05: 3, c06: 3, c07: 3, c08: 4, c09: 3, c10: 2,
-        c11: 3, c12: 2, c13: 4, c14: 1, c15: 6, c16: 2, c17: 3, c18: 4, c19: 3, c20: 3 };
+        c11: 3, c12: 2, c13: 4, c14: 1, c15: 6, c16: 2, c17: 3, c18: 4, c19: 3, c20: 3,
+        c21: 1, c22: 2, c23: 3, c24: 2, c25: 4, c26: 4, c27: 5, c28: 5, c29: 5, c30: 6 };
       var pvpCostCache = null, pvpCostCacheAt = 0;
       async function pvpCostMap(env) {
         var now = Date.now();
