@@ -1,5 +1,5 @@
 /* SPHERIA API — Cloudflare Worker + D1 (file unico, pronto da incollare in dashboard).
- * Versione logica: pvp29 (come pvp28 + stagioni bisettimanali server, rivincita, emote, anti-farm).
+ * Versione logica: pvp30 (come pvp29 + statistiche sviluppatore anonime: /api/ping + /api/stats).
  * Salvataggio completo (volto/volti/stagione-premi/gettoni/mini-bustine/nuovi-contatori),
  * niente più reset mensile: i punti ranked restano per sempre e si scende solo perdendo
  * (la "stagione" premi vive sul client con la barra bisettimanale).
@@ -244,7 +244,90 @@ export default {
     try {
       // ---------- salute (test da browser) ----------
       if (req.method === "GET" && path === "/api/health") {
-        return json(env, req, { ok: true, time: Date.now(), v: "pvp29" });
+        return json(env, req, { ok: true, time: Date.now(), v: "pvp30" });
+      }
+
+      // ---------- STATISTICHE SVILUPPATORE (anonime, livello minimo) ----------
+      // Tabelle create al volo: nessuna migration manuale (ma su DB nuovi vedi schema.sql).
+      // stats_daily(day, ev, n): conteggi per giorno UTC; stats_seen(day, uid): un utente/giorno.
+      // Eventi: open (aperture), users (utenti unici), game (partite finite), game_bot, game_pvp.
+      // POST /api/ping {ev:"open"|"game", uid:[16-32 hex], mode?:"bot"|"pvp"} — pubblico.
+      // GET /api/stats?days=30 — solo con Bearer DEV_TOKEN (variabile d'ambiente del Worker,
+      // MAI nel codice: il sorgente è pubblico). Senza DEV_TOKEN impostato risponde 403.
+      async function ensureStatsTables(env) {
+        try {
+          await env.DB.prepare("CREATE TABLE IF NOT EXISTS stats_daily (day TEXT NOT NULL, ev TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, ev))").run();
+        } catch (e) {}
+        try {
+          await env.DB.prepare("CREATE TABLE IF NOT EXISTS stats_seen (day TEXT NOT NULL, uid TEXT NOT NULL, at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, uid))").run();
+        } catch (e) {}
+      }
+      function statsDayUTC(daysBack) {
+        var d = new Date(Date.now() - (daysBack | 0) * 86400000);
+        return d.getUTCFullYear() + "-" + ("0" + (d.getUTCMonth() + 1)).slice(-2) + "-" + ("0" + d.getUTCDate()).slice(-2);
+      }
+      async function statsBump(env, day, ev, by) {
+        try {
+          await env.DB.prepare("INSERT INTO stats_daily (day, ev, n) VALUES (?, ?, ?) ON CONFLICT(day, ev) DO UPDATE SET n = n + excluded.n")
+            .bind(day, ev, by | 0 || 1).run();
+        } catch (e) {}
+      }
+      if (req.method === "POST" && path === "/api/ping") {
+        var pbody = null;
+        try { pbody = await readJson(req, 500); }
+        catch (e) { return json(env, req, { error: "bad_request" }, 400); }
+        var pev = String(pbody.ev || "");
+        if (pev !== "open" && pev !== "game") return json(env, req, { error: "bad_ev" }, 400);
+        var puid = String(pbody.uid || "");
+        if (!/^[0-9a-f]{16,32}$/.test(puid)) return json(env, req, { error: "bad_uid" }, 400);
+        var pmode = pev === "game" ? String(pbody.mode || "") : "";
+        if (pmode !== "bot" && pmode !== "pvp") pmode = "";
+        await ensureStatsTables(env);
+        var pday = statsDayUTC(0), pnow = Date.now();
+        // Anti-spam blando senza salvare IP: max 1 ping ogni 4s per uid (aperture: 1/sessione, partite: minuti)
+        try {
+          var pseen = await env.DB.prepare("SELECT at FROM stats_seen WHERE day = ? AND uid = ?").bind(pday, puid).first();
+          if (pseen && pnow - (pseen.at | 0) < 4000) return json(env, req, { error: "too_fast" }, 429);
+          await env.DB.prepare("INSERT INTO stats_seen (day, uid, at) VALUES (?, ?, ?) ON CONFLICT(day, uid) DO UPDATE SET at = excluded.at")
+            .bind(pday, puid, pnow).run();
+          if (!pseen) await statsBump(env, pday, "users", 1); // primo ping del giorno = utente unico
+        } catch (e) {}
+        await statsBump(env, pday, pev === "open" ? "open" : "game", 1);
+        if (pev === "game" && pmode) await statsBump(env, pday, "game_" + pmode, 1);
+        // Pulizia occasionale: righe uid vecchie oltre 60 giorni (i totali restano in stats_daily)
+        try {
+          if (Math.random() < 0.02) {
+            await env.DB.prepare("DELETE FROM stats_seen WHERE day < ?").bind(statsDayUTC(60)).run();
+          }
+        } catch (e) {}
+        return json(env, req, { ok: true });
+      }
+      if (req.method === "GET" && path === "/api/stats") {
+        var stoken = (req.headers.get("Authorization") || "").match(/^Bearer\s+(\S+)$/i);
+        if (!env.DEV_TOKEN || !stoken || stoken[1] !== env.DEV_TOKEN)
+          return json(env, req, { error: "forbidden" }, 403);
+        var sdays = parseInt((new URL(req.url).searchParams.get("days") || "30"), 10) || 30;
+        if (sdays < 1) sdays = 1;
+        if (sdays > 90) sdays = 90;
+        await ensureStatsTables(env);
+        var srows = await env.DB.prepare("SELECT day, ev, n FROM stats_daily WHERE day >= ? ORDER BY day ASC")
+          .bind(statsDayUTC(sdays - 1)).all();
+        var smap = {};
+        (srows.results || []).forEach(function (r) {
+          if (!smap[r.day]) smap[r.day] = { day: r.day, users: 0, open: 0, game: 0, bot: 0, pvp: 0 };
+          var m = smap[r.day];
+          if (r.ev === "users") m.users = r.n | 0;
+          else if (r.ev === "open") m.open = r.n | 0;
+          else if (r.ev === "game") m.game = r.n | 0;
+          else if (r.ev === "game_bot") m.bot = r.n | 0;
+          else if (r.ev === "game_pvp") m.pvp = r.n | 0;
+        });
+        var sset = [];
+        for (var si = sdays - 1; si >= 0; si--) {
+          var sd = statsDayUTC(si);
+          sset.push(smap[sd] || { day: sd, users: 0, open: 0, game: 0, bot: 0, pvp: 0 });
+        }
+        return json(env, req, { ok: true, days: sset });
       }
 
       // ---------- login Google -> sessione ----------
